@@ -6,6 +6,10 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # Abandoned active uploads (idle longer than this) are reaped by
+      # POST /v1/maintenance/reap-sessions. Uncomment to override the default
+      # of 3600 seconds:
+      # SESSION_IDLE_TIMEOUT_SECONDS: "3600"
     volumes:
       # Single volume: chunk staging, object store and SQLite live on the
       # same filesystem so merges publish via atomic rename. Share tokens,

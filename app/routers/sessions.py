@@ -20,7 +20,13 @@ from ..schemas import (
     SessionResponse,
     SessionStatusResponse,
 )
-from ..service import expected_chunk_size, merge_chunks, reset_merge_to_active, utcnow
+from ..service import (
+    expected_chunk_size,
+    get_reaped_session,
+    merge_chunks,
+    reset_merge_to_active,
+    utcnow,
+)
 from ..storage import chunk_dir_for, chunk_path, new_tmp_path, object_path
 
 router = APIRouter()
@@ -31,8 +37,23 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 def _get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if row is None:
+        if get_reaped_session(conn, session_id) is not None:
+            raise HTTPException(status_code=410, detail="session has been reaped")
         raise HTTPException(status_code=404, detail="session not found")
     return row
+
+
+def _discard_published_chunk(session_id: str, dest) -> None:
+    """Drop a chunk file published while the session was being reaped.
+
+    The reap deletes the whole staging directory, so also try to remove the now
+    empty directory to guarantee nothing is left behind.
+    """
+    dest.unlink(missing_ok=True)
+    try:
+        dest.parent.rmdir()
+    except OSError:
+        pass
 
 
 def _received_count(conn: sqlite3.Connection, session_id: str) -> int:
@@ -111,6 +132,8 @@ async def upload_chunk(
 
     with db_conn() as conn:
         session = _get_session(conn, session_id)
+        if session["status"] == "reaping":
+            raise HTTPException(status_code=410, detail="session is being reaped")
         if session["status"] != "active":
             raise HTTPException(
                 status_code=409, detail=f"session is {session['status']}, not accepting chunks"
@@ -183,8 +206,13 @@ async def upload_chunk(
             "SELECT status FROM sessions WHERE id=?", (session_id,)
         ).fetchone()
         if row is None:
-            dest.unlink(missing_ok=True)
+            _discard_published_chunk(session_id, dest)
+            if get_reaped_session(conn, session_id) is not None:
+                raise HTTPException(status_code=410, detail="session has been reaped")
             raise HTTPException(status_code=404, detail="session not found")
+        if row["status"] == "reaping":
+            _discard_published_chunk(session_id, dest)
+            raise HTTPException(status_code=410, detail="session is being reaped")
         if row["status"] != "active":
             dest.unlink(missing_ok=True)
             raise HTTPException(
@@ -218,6 +246,8 @@ def session_status(session_id: str) -> SessionStatusResponse:
     """Resume/breakpoint query: which chunks the server already has."""
     with db_conn() as conn:
         session = _get_session(conn, session_id)
+        if session["status"] == "reaping":
+            raise HTTPException(status_code=410, detail="session is being reaped")
         uploaded = [
             row["chunk_index"]
             for row in conn.execute(
@@ -258,6 +288,8 @@ def complete_session(session_id: str) -> CompleteResponse:
 
     with db_conn() as conn, immediate_tx(conn):
         session = _get_session(conn, session_id)
+        if session["status"] == "reaping":
+            raise HTTPException(status_code=410, detail="session is being reaped")
         if session["status"] == "completed":
             # Idempotent retry of an already-finished complete.
             return CompleteResponse(
@@ -287,10 +319,13 @@ def complete_session(session_id: str) -> CompleteResponse:
                 },
             )
         # The gate: exactly one concurrent request flips active -> merging.
-        conn.execute(
+        # It also loses to the reaper's active -> reaping transition.
+        cur = conn.execute(
             "UPDATE sessions SET status='merging', updated_at=? WHERE id=? AND status='active'",
             (utcnow(), session_id),
         )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=410, detail="session is being reaped")
         total_chunks = session["total_chunks"]
         declared_sha = session["file_sha256"]
         file_name = session["file_name"]
@@ -336,11 +371,16 @@ def complete_session(session_id: str) -> CompleteResponse:
             " ON CONFLICT(sha256) DO UPDATE SET ref_count=ref_count+1",
             (digest, file_name, size, now),
         )
-        conn.execute(
+        cur = conn.execute(
             "UPDATE sessions SET status='completed', archive_sha256=?, last_error=NULL,"
-            " updated_at=?, completed_at=? WHERE id=?",
+            " updated_at=?, completed_at=? WHERE id=? AND status='merging'",
             (digest, now, now, session_id),
         )
+        if cur.rowcount == 0:
+            # Defensive: a merging session can never be reaped by the reaper
+            # (only 'active' sessions are claimed), so this should not happen.
+            # Roll back the reference bump rather than publish half a result.
+            raise HTTPException(status_code=410, detail="session has been reaped")
         conn.execute("DELETE FROM chunks WHERE session_id=?", (session_id,))
 
     shutil.rmtree(chunk_dir_for(settings, session_id), ignore_errors=True)
@@ -365,6 +405,8 @@ def delete_session(session_id: str) -> DeleteSessionResponse:
     archive_released = False
     with db_conn() as conn, immediate_tx(conn):
         session = _get_session(conn, session_id)
+        if session["status"] == "reaping":
+            raise HTTPException(status_code=410, detail="session is being reaped")
         if session["status"] == "merging":
             raise HTTPException(status_code=409, detail="merge in progress, try again later")
         archive_sha = session["archive_sha256"]

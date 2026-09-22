@@ -131,3 +131,31 @@ class ShareStatusResponse(BaseModel):
 
 class RevokeShareResponse(BaseModel):
     revoked: bool = Field(description="False when the share was already revoked (call is idempotent)")
+
+
+class ReapSessionsRequest(BaseModel):
+    limit: int = Field(
+        ge=1,
+        le=1000,
+        description="Maximum number of idle active sessions to reap in this request",
+    )
+
+
+class ReapedSession(BaseModel):
+    session_id: str
+    received_chunks: int
+    released_bytes: int = Field(description="Bytes of staged chunk data removed")
+
+
+class ReapSessionsResponse(BaseModel):
+    run_id: str = Field(description="Id of this reap run (also used to resume an interrupted run)")
+    idle_timeout_seconds: int
+    limit: int
+    reaped: list[ReapedSession]
+    reaped_count: int
+    released_bytes: int = Field(description="Total bytes of staged chunk data removed")
+    recovered: bool = Field(
+        description="True when an interrupted reap from a previous process was finished first"
+    )
+    recovered_count: int = Field(description="Number of sessions cleaned up by crash recovery")
+    recovered_bytes: int

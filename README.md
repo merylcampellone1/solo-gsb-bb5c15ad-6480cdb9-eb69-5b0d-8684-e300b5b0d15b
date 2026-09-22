@@ -1,8 +1,9 @@
 # Large File Archive API
 
 基于 FastAPI 的大文件归档服务：分片断点续传、逐片 SHA-256 校验、并发安全的原子合并、
-整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象），以及基于一次性 token 的
-**受控分享下载**（有效期 + 最大下载次数，事务内原子扣减）。元数据存 SQLite，
+整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象），基于一次性 token 的
+**受控分享下载**（有效期 + 最大下载次数，事务内原子扣减），以及并发安全的**废弃上传回收**
+（按空闲阈值原子认领并清理遗弃会话与分片，崩溃后启动自动续清）。元数据存 SQLite，
 分片与归档对象存本地卷，启动时自动初始化数据库。
 
 ## 快速开始
@@ -57,6 +58,7 @@ pytest                 # 运行测试（每个用例使用独立临时数据目�
 | `GET` | `/v1/shares/{token}` | 查询分享状态（`active` / `expired` / `exhausted` / `revoked`、剩余次数） |
 | `GET` | `/v1/shares/{token}/download` | 分享下载：事务内校验未过期/未撤销/有剩余次数并原子扣减，随后流式下载；响应头 `X-Share-Remaining-Downloads` 给出剩余次数 |
 | `DELETE` | `/v1/shares/{token}` | 撤销分享（幂等；重复撤销返回 `revoked:false`） |
+| `POST` | `/v1/maintenance/reap-sessions` | 回收废弃上传：body `{"limit": N}`，原子认领至多 N 个空闲超过阈值的 `active` 会话，删除其分片并返回回收明细（`run_id`、`released_bytes` 等） |
 | `GET` | `/healthz` | 健康检查 |
 
 ### 分享错误码
@@ -71,6 +73,31 @@ pytest                 # 运行测试（每个用例使用独立临时数据目�
 
 注意：只有校验通过、成功认领下载时才扣减次数；过期/耗尽/撤销导致的失败**不扣次数**。
 归档被删除（引用计数归零）时，其分享通过外键级联一并删除，token 随即返回 404。
+
+### 废弃上传回收
+
+| 场景 | 状态码 | detail |
+| --- | --- | --- |
+| 会话正在被回收（认领后、清理完成前） | `410` | `session is being reaped` |
+| 会话已被回收（GET/PUT 分片/complete/DELETE） | `410` | `session has been reaped` |
+| `complete` 与回收并发且回收抢先 | `410` | `session is being reaped` |
+| `limit` 缺失或不在 1..1000 | `422` | 参数校验错误 |
+
+回收只针对 `updated_at` 早于 `now - SESSION_IDLE_TIMEOUT_SECONDS` 且仍为 `active` 的会话
+（创建会话或成功写入分片都会刷新 `updated_at`）；**`completed` 会话永不回收**，也不释放任何
+归档引用。被回收的会话不再保留 `sessions`/`chunks` 记录与分片目录，仅在 `reaped_sessions`
+保留一条回收台账（用于返回 410 与审计），`reap_runs` 记录每次回收批次。响应示例：
+
+```bash
+curl -s -X POST localhost:8000/v1/maintenance/reap-sessions \
+  -H 'Content-Type: application/json' -d '{"limit": 100}' | jq
+# {
+#   "run_id": "…", "idle_timeout_seconds": 3600, "limit": 100,
+#   "reaped": [{"session_id": "…", "received_chunks": 3, "released_bytes": 3145728}],
+#   "reaped_count": 1, "released_bytes": 3145728,
+#   "recovered": false, "recovered_count": 0, "recovered_bytes": 0
+# }
+```
 
 ### curl 示例
 
@@ -124,7 +151,7 @@ curl -X DELETE localhost:8000/v1/shares/$TOKEN
 **数据布局**（`DATA_DIR`，默认容器内 `/data`）
 
 ```
-archive.db                 SQLite（WAL 模式），含 sessions/chunks/archives/shares 表
+archive.db                 SQLite（WAL 模式），含 sessions/chunks/archives/shares/reaped_sessions/reap_runs 表
 chunks/<session>/<i>.part  各会话的分片暂存区
 objects/<aa>/<sha256>      内容寻址的归档对象（去重）
 tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保证 rename 原子）
@@ -142,8 +169,20 @@ tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保�
 - 去重：归档以内容 SHA-256 为主键 + 引用计数。创建会话时哈希已存在 → 秒传；
   合并后发现同内容对象 → 直接复用（`deduplicated: true`）。`DELETE` 会话释放引用，
   计数归零才删除底层对象，共享文件互不影响。
-- 崩溃恢复：启动时把残留的 `merging` 会话重置为 `active`（此时不可能有合并在进行），
-  并清理无属主的分片目录；SQLite 自动建库建表（含 `shares` 表），无需迁移工具。
+- 崩溃恢复：启动时先续清已认领但中断的回收（残留的 `reaping` 会话：删除分片目录、
+  补齐台账并删除会话/分片记录），再把残留的 `merging` 会话重置为 `active`
+  （此时不可能有合并在进行），并清理无属主的分片目录；SQLite 自动建库建表（含 `shares` /
+  `reaped_sessions` / `reap_runs` 表，旧库自动迁移状态约束），无需迁移工具。
+- 废弃回收：`POST /v1/maintenance/reap-sessions` 在单个 `BEGIN IMMEDIATE` 事务里选出空闲超过
+  `SESSION_IDLE_TIMEOUT_SECONDS` 的 `active` 会话，并以条件更新
+  `UPDATE sessions SET status='reaping' WHERE id=? AND status='active'` 逐条原子认领
+  （`rowcount=0` 即已被并发的分片上传 / complete 抢先，本轮跳过——竞态双方只有一个成功）。
+  认领提交后状态本身就是闸门：随后分片上传、complete 一律返回 `410`，已完成（`completed`）的
+  会话永远不会被选中。认领后回收方删除分片目录，再在单个事务内统计释放字节、写入 `reaped_sessions`
+  台账、删除 `chunks` 与 `sessions` 行；此后该会话的一切请求凭台账返回 `410 Gone`，磁盘与业务
+  记录均无残留（失败的上传方会删掉刚落盘的分片并尝试移除空目录，不会给已回收会话留下文件）。
+  若进程在认领之后、终结之前崩溃，会话停留在 `reaping`：下次启动（或下次调用回收接口）会先完成
+  这些回收并在响应中以 `recovered*` 字段报告。
 - 受控分享：创建分享时生成 32 字节 CSPRNG 随机 token（URL-safe），数据库只存它的
   SHA-256（`token_hash` 主键）——即使库文件泄露也无法还原 token，原始 token 仅在创建
   响应中返回一次。`GET /v1/shares/{token}/download` 在单个 `BEGIN IMMEDIATE` 事务内
@@ -170,6 +209,7 @@ tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保�
 | --- | --- | --- |
 | `DATA_DIR` | `./data`（容器内 `/data`） | 数据根目录 |
 | `DB_PATH` | `$DATA_DIR/archive.db` | SQLite 文件路径 |
+| `SESSION_IDLE_TIMEOUT_SECONDS` | `3600` | 空闲阈值（秒）：`active` 会话超过该时长无创建/分片活动即可被回收；必须 ≥ 1 |
 
 ## 项目结构
 
@@ -184,7 +224,9 @@ app/
   routers/sessions.py 会话与分片端点
   routers/archives.py 归档查询、原始下载端点、创建分享
   routers/shares.py   受控分享：状态查询、原子认领下载、撤销
+  routers/maintenance.py 废弃上传回收端点（条件认领 + 续清中断回收）
 tests/test_api.py     端到端测试（乱序/重复/断点/哈希校验/去重/清理）
 tests/test_shares.py  分享测试（次数/过期/撤销/并发抢占/重启持久化/级联删除）
+tests/test_reaping.py 回收测试（阈值/limit/completed 不回收/410/上传与合并竞态/并发回收/重启续清/旧库迁移）
 Dockerfile / docker-compose.yml
 ```
