@@ -1,0 +1,18 @@
+services:
+  archive-api:
+    build: .
+    image: archive-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      # Single volume: chunk staging, object store and SQLite live on the
+      # same filesystem so merges publish via atomic rename. Share tokens,
+      # quotas and expiry live in archive.db on this volume, so controlled
+      # shares (remaining downloads / revoked state) survive restarts.
+      - archive-data:/data
+    restart: unless-stopped
+
+volumes:
+  archive-data:
