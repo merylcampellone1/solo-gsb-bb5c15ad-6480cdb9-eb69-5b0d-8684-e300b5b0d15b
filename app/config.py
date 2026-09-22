@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+_DEFAULT_IDLE_TIMEOUT_SECONDS = 3600  # active sessions untouched for 1 hour are reapable
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -14,6 +16,20 @@ class Settings:
     chunk_dir: Path
     object_dir: Path
     tmp_dir: Path
+    session_idle_timeout_seconds: int
+
+
+def _idle_timeout_from_env() -> int:
+    raw = os.environ.get("SESSION_IDLE_TIMEOUT_SECONDS", str(_DEFAULT_IDLE_TIMEOUT_SECONDS)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"SESSION_IDLE_TIMEOUT_SECONDS must be a non-negative integer, got {raw!r}"
+        ) from exc
+    if value < 0:
+        raise RuntimeError("SESSION_IDLE_TIMEOUT_SECONDS must be a non-negative integer")
+    return value
 
 
 @lru_cache
@@ -26,6 +42,7 @@ def get_settings() -> Settings:
         chunk_dir=data_dir / "chunks",
         object_dir=data_dir / "objects",
         tmp_dir=data_dir / "tmp",
+        session_idle_timeout_seconds=_idle_timeout_from_env(),
     )
 
 

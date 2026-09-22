@@ -131,3 +131,18 @@ class ShareStatusResponse(BaseModel):
 
 class RevokeShareResponse(BaseModel):
     revoked: bool = Field(description="False when the share was already revoked (call is idempotent)")
+
+
+class ReapSessionsRequest(BaseModel):
+    limit: int = Field(
+        ge=1,
+        le=100_000,
+        description="Maximum number of idle active sessions to reclaim in this call",
+    )
+
+
+class ReapSessionsResponse(BaseModel):
+    limit: int
+    reaped: int = Field(description="Number of sessions reclaimed")
+    reaped_ids: list[str] = Field(description="IDs of the reclaimed sessions")
+    released_bytes: int = Field(description="Staged chunk bytes freed")

@@ -35,6 +35,12 @@ def _get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
     return row
 
 
+def _reject_if_reaping(session: sqlite3.Row) -> None:
+    """A session the reaper has claimed (active -> reaping) is gone for clients."""
+    if session["status"] == "reaping":
+        raise HTTPException(status_code=410, detail="session has been reaped")
+
+
 def _received_count(conn: sqlite3.Connection, session_id: str) -> int:
     return conn.execute(
         "SELECT COUNT(*) AS c FROM chunks WHERE session_id=?", (session_id,)
@@ -111,6 +117,7 @@ async def upload_chunk(
 
     with db_conn() as conn:
         session = _get_session(conn, session_id)
+        _reject_if_reaping(session)
         if session["status"] != "active":
             raise HTTPException(
                 status_code=409, detail=f"session is {session['status']}, not accepting chunks"
@@ -178,29 +185,40 @@ async def upload_chunk(
     os.replace(tmp, dest)  # atomic publish of the chunk file
 
     now = utcnow()
-    with db_conn() as conn, immediate_tx(conn):
-        row = conn.execute(
-            "SELECT status FROM sessions WHERE id=?", (session_id,)
-        ).fetchone()
-        if row is None:
-            dest.unlink(missing_ok=True)
-            raise HTTPException(status_code=404, detail="session not found")
-        if row["status"] != "active":
-            dest.unlink(missing_ok=True)
-            raise HTTPException(
-                status_code=409, detail=f"session is {row['status']}, not accepting chunks"
+    try:
+        with db_conn() as conn, immediate_tx(conn):
+            row = conn.execute(
+                "SELECT status FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            if row["status"] == "reaping":
+                raise HTTPException(status_code=410, detail="session has been reaped")
+            if row["status"] != "active":
+                raise HTTPException(
+                    status_code=409, detail=f"session is {row['status']}, not accepting chunks"
+                )
+            conn.execute(
+                "INSERT INTO chunks (session_id, chunk_index, size, sha256, uploaded_at)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(session_id, chunk_index) DO UPDATE SET"
+                "   size=excluded.size, sha256=excluded.sha256, uploaded_at=excluded.uploaded_at",
+                (session_id, chunk_index, size, client_sha, now),
             )
-        conn.execute(
-            "INSERT INTO chunks (session_id, chunk_index, size, sha256, uploaded_at)"
-            " VALUES (?,?,?,?,?)"
-            " ON CONFLICT(session_id, chunk_index) DO UPDATE SET"
-            "   size=excluded.size, sha256=excluded.sha256, uploaded_at=excluded.uploaded_at",
-            (session_id, chunk_index, size, client_sha, now),
-        )
-        conn.execute(
-            "UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id)
-        )
-        received = _received_count(conn, session_id)
+            conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id)
+            )
+            received = _received_count(conn, session_id)
+    except HTTPException:
+        # Lost the race against the reaper (or another state change): the chunk
+        # must not survive as an orphan file or leave an empty staging dir.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.unlink(missing_ok=True)
+        try:
+            dest.parent.rmdir()
+        except OSError:
+            pass
+        raise
 
     return ChunkUploadResponse(
         session_id=session_id,
@@ -218,6 +236,7 @@ def session_status(session_id: str) -> SessionStatusResponse:
     """Resume/breakpoint query: which chunks the server already has."""
     with db_conn() as conn:
         session = _get_session(conn, session_id)
+        _reject_if_reaping(session)
         uploaded = [
             row["chunk_index"]
             for row in conn.execute(
@@ -268,6 +287,8 @@ def complete_session(session_id: str) -> CompleteResponse:
                 deduplicated=True,
             )
         if session["status"] != "active":
+            if session["status"] == "reaping":
+                raise HTTPException(status_code=410, detail="session has been reaped")
             raise HTTPException(status_code=409, detail="merge already in progress")
         received = _received_count(conn, session_id)
         if received < session["total_chunks"]:
@@ -365,6 +386,8 @@ def delete_session(session_id: str) -> DeleteSessionResponse:
     archive_released = False
     with db_conn() as conn, immediate_tx(conn):
         session = _get_session(conn, session_id)
+        if session["status"] == "reaping":
+            raise HTTPException(status_code=410, detail="session has been reaped")
         if session["status"] == "merging":
             raise HTTPException(status_code=409, detail="merge in progress, try again later")
         archive_sha = session["archive_sha256"]

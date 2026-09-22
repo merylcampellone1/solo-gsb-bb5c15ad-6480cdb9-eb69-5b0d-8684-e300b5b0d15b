@@ -6,6 +6,10 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # Active upload sessions idle for this many seconds can be reclaimed via
+      # POST /v1/maintenance/reap-sessions. 0 means every active session is
+      # eligible on the next call; completed sessions are never reaped.
+      SESSION_IDLE_TIMEOUT_SECONDS: "3600"
     volumes:
       # Single volume: chunk staging, object store and SQLite live on the
       # same filesystem so merges publish via atomic rename. Share tokens,
